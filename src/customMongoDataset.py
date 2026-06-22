@@ -25,7 +25,7 @@ class CustomMongoDataset(MongoDataset):
     def __getitem__(self, batch):
         # Fetch all samples for ids in the batch and where 'kind' is either
         # data or label as specified by the sample parameter
-        
+
         samples = list(
             self.collection["bin"].find(
                 {
@@ -36,14 +36,18 @@ class CustomMongoDataset(MongoDataset):
             )
         )
 
-        # Batched .meta query for all subjects in batch — one query instead of N
-        meta_results = {
-            doc[self.id]: doc[self.meta_sample[0]]
-            for doc in self.collection["meta"].find(
-                {self.id: {"$in": [self.indices[_] for _ in batch]}},
-                {self.id: 1, self.meta_sample[0]: 1, "_id": 0}
+        # Batch metadata query: fetch all metadata for the batch at once (not N queries)
+        batch_ids = [self.indices[_] for _ in batch]
+        all_meta = list(
+            self.collection["meta"].find(
+                {
+                    self.id: {"$in": batch_ids},
+                },
+                self.meta_sample + (self.id,),
             )
-        }
+        )
+        # Create mapping from ID to metadata for fast lookup
+        meta_lookup = {meta[self.id]: meta for meta in all_meta}
 
         results = {}
         for id in batch:
@@ -57,12 +61,11 @@ class CustomMongoDataset(MongoDataset):
             # Separate processing for each 'kind' # TODO: for multimodal, pull all kinds here and then just match them with labels properly
             data = self.make_serial(samples_for_id, self.sample[0])
 
-            #assert len(meta_for_id) != 0, f"No meta entries found for id {id}"
-            #assert len(meta_for_id) < 2, f"More than one meta entry found for id {id}"
-            assert self.indices[id] in meta_results, f"No meta entries found for id {id}"
+            # Lookup metadata from pre-fetched batch (no DB query here)
+            meta_for_id = meta_lookup.get(self.indices[id])
+            assert meta_for_id is not None, f"No meta entries found for id {id}"
 
-            
-            label = meta_results[self.indices[id]] #meta_for_id[0][self.meta_sample[0]]
+            label = meta_for_id[self.meta_sample[0]]
 
             # Add to results
             results[id] = {
@@ -100,60 +103,65 @@ class MultimodalMongoDataset(MongoDataset):
     def __getitem__(self, batch):
         # Fetch all samples for ids in the batch and where 'kind' is either
         # data or label as specified by the sample parameter
-        # TODO: make it respect the batch size; right now it returns a bigger batch with multiple modalities per id
         
+        # 1. Fetch binary data in one batch
         samples = list(
             self.collection["bin"].find(
                 {
                     self.id: {"$in": [self.indices[_] for _ in batch]},
-                    "kind": {"$in": self.sample}, # .bin contains 3D kinds like 'smri', 'falff', 'dwi'. Scalar labels are stored in .meta
+                    "kind": {"$in": self.sample}, # .bin contains 3D kinds like 'smri', 'falff', 'dwi'. 
                 },
                 self.fields,
             )
         )
 
-        # Batched .meta query for all subjects in batch — one query instead of N
-        meta_results = {
-            doc[self.id]: {
-                self.meta_sample[0]: doc[self.meta_sample[0]],
-                "modalities": doc["modalities"],
-            }
-            for doc in self.collection["meta"].find(
-                {self.id: {"$in": [self.indices[_] for _ in batch]}},
-                {self.id: 1, self.meta_sample[0]: 1, "modalities": 1, "_id": 0}
-            )
-        }
+        # Pre-group chunks by (id, kind) for O(N) access instead of O(N^2) filtering
+        chunks_by_id_kind = {}
+        for s in samples:
+            key = (s[self.id], s["kind"])
+            if key not in chunks_by_id_kind:
+                chunks_by_id_kind[key] = []
+            chunks_by_id_kind[key].append(s)
 
+        # 2. Batch metadata query: fetch all metadata for the batch at once
+        batch_ids = [self.indices[_] for _ in batch]
+        all_meta = list(
+            self.collection["meta"].find(
+                {
+                    self.id: {"$in": batch_ids},
+                },
+                self.meta_sample + ("modalities", self.id),
+            )
+        )
+        # Create mapping from ID to metadata for fast lookup
+        meta_lookup = {meta[self.id]: meta for meta in all_meta}
 
         results = {}
         for id in batch:
-            # get ID's label and modalities
-            
+            # Lookup metadata from pre-fetched batch
+            meta_for_id = meta_lookup.get(self.indices[id])
+            if meta_for_id is None:
+                continue
 
-            assert self.indices[id] in meta_results, f"No meta entries found for id {id}"
-            meta = meta_results[self.indices[id]]
-            label = meta[self.meta_sample[0]]
-
-            modalities =  meta["modalities"] #meta_for_id[0]["modalities"]
+            label = meta_for_id[self.meta_sample[0]]
+            modalities = meta_for_id["modalities"]
             id_modalities = set(modalities).intersection(set(self.sample))
-                
-
-            # Get samples for this ID
-            samples_for_id = [
-                sample
-                for sample in samples
-                if sample[self.id] == self.indices[id]
-            ]
 
             for mod in id_modalities:
-                data = self.make_serial(samples_for_id, mod)
+                # Optimized: get pre-grouped chunks and sort them
+                samples_for_id_kind = chunks_by_id_kind.get((self.indices[id], mod), [])
+                if not samples_for_id_kind:
+                    continue
+                
+                # Sort chunks by chunk_id and join
+                samples_for_id_kind.sort(key=lambda x: x["chunk_id"])
+                data = b"".join([s["chunk"] for s in samples_for_id_kind])
 
                 result = {
                     "input": self.normalize(self.transform(data).float()),
                     "modality": mod,
                     "label": torch.tensor(label).unsqueeze(0),
                 }
-
 
                 # Add to results
                 results[str(id)+'_'+mod] = result

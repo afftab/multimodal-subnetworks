@@ -90,8 +90,4 @@ class ClientCreator:
         return crop_tensor(*mcollate(x)) if self.crop_tensor else mcollate(x)
 
     def mytransform(self, x):
-        import io, lz4.frame, torch
-        LZ4_MAGIC = b"\x04\x22\x4d\x18"
-        if x[:4] == LZ4_MAGIC:
-            x = lz4.frame.decompress(x)
-        return torch.load(io.BytesIO(x), weights_only=False)
+        return mtransform(x)

@@ -145,6 +145,10 @@ dmypy.json
 .pyre/
 
 # custom
+data/
+analyze_runs.py
+fetch_wandb_runs.py
+report.py
 .vscode
 .DS_Store
 .csv
@@ -167,10 +171,7 @@ jupyter_node*
 jnode-*
 env.yml
 __stuff
-minimal_fmri_classification/
-prep/
-mongotest/
-labels_serialized.txt
-labels_meta.txt
-file_structure.txt
-plots/
+
+fetch_new_runs.py
+src/customMongoDataset.OLD.py
+train_script_rev.OLD.py
