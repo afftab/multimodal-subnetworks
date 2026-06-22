@@ -25,7 +25,6 @@ class CustomMongoDataset(MongoDataset):
     def __getitem__(self, batch):
         # Fetch all samples for ids in the batch and where 'kind' is either
         # data or label as specified by the sample parameter
-
         samples = list(
             self.collection["bin"].find(
                 {

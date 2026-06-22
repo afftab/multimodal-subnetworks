@@ -153,6 +153,40 @@ class MultiMaskSNIPWrapper(nn.Module):
         
         self.masks_registered = True
 
+    # --- INTERNAL SNIP HELPERS ---
+    def _generate_mask_from_grad_scores(self, model, optimizer, batch, target_device):
+        scores_dict = self._calculate_scores(model, optimizer, batch)
+        threshold = self._get_threshold_from_scores(scores_dict)
+
+        masks = {}
+        for name, values in scores_dict.items():
+            masks[name] = (values > threshold).float().to(target_device)
+        return masks
+
+    def _calculate_scores(self, model, optimizer, batch):
+        data, labels = batch
+
+        model.train()
+        optimizer.zero_grad()
+
+        preds = model(data)
+        loss = F.binary_cross_entropy_with_logits(preds, labels.float())
+        loss.backward()
+
+        scores_d = {}
+        for name, module in model.named_modules():
+            if isinstance(module, PRUNE_LAYERS) and module.weight.grad is not None:
+                # SNIP score = |grad * weight|
+                scores_d[name] = (module.weight.grad * module.weight.data).abs()
+        return scores_d
+
+    def _get_threshold_from_scores(self, scores_d):
+        global_scores = torch.cat([torch.flatten(x) for x in scores_d.values()])
+        num_params_to_keep = int(len(global_scores) * (1.0 - self.sparsity))
+        if num_params_to_keep < 1: num_params_to_keep = 1
+        topk_scores, _ = torch.topk(global_scores, num_params_to_keep, sorted=True)
+        return topk_scores[-1]
+
     def initialize_from_unimodal_models(self, unimodal_models_dict, snip_data=None):
         """
         Initialize the multimodal sparse model from trained unimodal sparse models.
@@ -272,37 +306,3 @@ class MultiMaskSNIPWrapper(nn.Module):
                 print(f"Layer {name}: combined mask sparsity = {1 - combined_mask.mean().item():.2%}")
 
         print("Initialization complete!")
-
-    # --- INTERNAL SNIP HELPERS ---
-    def _generate_mask_from_grad_scores(self, model, optimizer, batch, target_device):
-        scores_dict = self._calculate_scores(model, optimizer, batch)
-        threshold = self._get_threshold_from_scores(scores_dict)
-
-        masks = {}
-        for name, values in scores_dict.items():
-            masks[name] = (values > threshold).float().to(target_device)
-        return masks
-
-    def _calculate_scores(self, model, optimizer, batch):
-        data, labels = batch
-
-        model.train()
-        optimizer.zero_grad()
-
-        preds = model(data)
-        loss = F.binary_cross_entropy_with_logits(preds, labels.float())
-        loss.backward()
-
-        scores_d = {}
-        for name, module in model.named_modules():
-            if isinstance(module, PRUNE_LAYERS) and module.weight.grad is not None:
-                # SNIP score = |grad * weight|
-                scores_d[name] = (module.weight.grad * module.weight.data).abs()
-        return scores_d
-
-    def _get_threshold_from_scores(self, scores_d):
-        global_scores = torch.cat([torch.flatten(x) for x in scores_d.values()])
-        num_params_to_keep = int(len(global_scores) * (1.0 - self.sparsity))
-        if num_params_to_keep < 1: num_params_to_keep = 1
-        topk_scores, _ = torch.topk(global_scores, num_params_to_keep, sorted=True)
-        return topk_scores[-1]

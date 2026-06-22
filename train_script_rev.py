@@ -25,7 +25,6 @@ from resnet import ResNet3D
 from mindfultensors.mongoloader import MongoClient
 from mindfultensors.utils import DBBatchSampler
 
-
 def safe_normalize(img):
     mn, mx = img.min(), img.max()
     if mx - mn < 1e-8:
@@ -354,7 +353,7 @@ class CustomRunner(dl.Runner):
             id=self.index_id,
         )
         
-        # cv_seed comes from config — identical on every DDP rank, unlike module-level SEED.
+        # cv_seed comes from config — identical on 
         cv_seed = self._hparams["experiment"].get("cv_seed", 42)
 
         if self.engine.is_ddp:
