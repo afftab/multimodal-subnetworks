@@ -8,6 +8,7 @@ import os
 import csv
 import random
 import shutil
+import math
 from packaging import version
 import yaml
 
@@ -22,14 +23,14 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from resnet import ResNet3D
 
 from mindfultensors.mongoloader import MongoClient
-from mindfultensors.utils import unit_interval_normalize, DBBatchSampler
+from mindfultensors.utils import DBBatchSampler
 
 def safe_normalize(img):
-    """Unit interval normalization with epsilon protection against zero-variance volumes."""
     mn, mx = img.min(), img.max()
     if mx - mn < 1e-8:
         return torch.zeros_like(img)
     return (img - mn) / (mx - mn)
+
 
 from src.db_client import ClientCreator
 from src.customMongoDataset import CustomMongoDataset, MultimodalMongoDataset, multimodal_collate, make_serial
@@ -40,8 +41,8 @@ SEED = random.randint(0, 9999)
 utils.set_global_seed(SEED)
 setup_distributed_port(seed=SEED)
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:100"
-#os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
 # os.environ["NCCL_SOCKET_IFNAME"] = "ib0"
 # os.environ["NCCL_P2P_LEVEL"] = "NVL"
 
@@ -50,6 +51,63 @@ if version.parse(torch_version) >= version.parse("2.3"):
     scaler = torch.amp.GradScaler()
 else:
     scaler = torch.cuda.amp.GradScaler()
+
+
+def get_rank_world():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank(), torch.distributed.get_world_size()
+    return int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+
+
+class DistributedDBBatchSampler(DBBatchSampler):
+    """
+    Rank-sharded variant of DBBatchSampler.
+
+    DataLoader passes each yielded item to MongoDataset.__getitem__ as a batch
+    of subject indices, so sharding must happen before those mini-batches are
+    formed. Padding keeps each DDP rank at the same number of steps.
+    """
+
+    def __init__(
+        self,
+        data_source,
+        batch_size=1,
+        seed=None,
+        rank=None,
+        world_size=None,
+    ):
+        super().__init__(data_source, batch_size=batch_size, seed=seed)
+        detected_rank, detected_world_size = get_rank_world()
+        self.rank = detected_rank if rank is None else rank
+        self.world_size = detected_world_size if world_size is None else world_size
+        self.global_batch_size = self.batch_size * self.world_size
+        self.num_batches = int(math.ceil(self.data_size / self.global_batch_size))
+        self.total_size = self.num_batches * self.global_batch_size
+
+    def __iter__(self):
+        if self.seed is not None:
+            rng = np.random.default_rng(self.seed)
+            indices = rng.permutation(self.data_size)
+        else:
+            indices = np.random.permutation(self.data_size)
+
+        padding_size = self.total_size - len(indices)
+        if padding_size > 0 and len(indices) > 0:
+            repeats = int(math.ceil(padding_size / len(indices)))
+            padding = np.tile(indices, repeats)[:padding_size]
+            indices = np.concatenate([indices, padding])
+
+        rank_batches = []
+        for start in range(0, self.total_size, self.global_batch_size):
+            global_batch = indices[start : start + self.global_batch_size]
+            rank_start = self.rank * self.batch_size
+            rank_end = rank_start + self.batch_size
+            rank_batches.append(global_batch[rank_start:rank_end])
+
+        return iter(rank_batches)
+
+    def __len__(self):
+        return self.num_batches
     
 # CustomRunner – PyTorch for-loop decomposition
 # https://github.com/catalyst-team/catalyst#minimal-examples
@@ -80,8 +138,17 @@ class CustomRunner(dl.Runner):
         db_fields: tuple,
         meta_fields: tuple,
         groupnorm=False,
-        prefetches=4,
-        num_workers=8,
+        prefetches=8,
+        num_workers=6,
+        prefetch_factor=2,
+        train_prefetches=None,
+        train_num_workers=None,
+        train_prefetch_factor=None,
+        train_persistent_workers=True,
+        eval_prefetches=None,
+        eval_num_workers=None,
+        eval_prefetch_factor=None,
+        eval_persistent_workers=True,
         volume_shape=[256] * 3,
         subvolume_shape=[256] * 3,
         lowprecision=False,
@@ -103,6 +170,15 @@ class CustomRunner(dl.Runner):
         self.rmsprop_lr = rmsprop_lr
         self.prefetches = prefetches
         self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor
+        self.train_prefetches = train_prefetches if train_prefetches is not None else prefetches
+        self.train_num_workers = train_num_workers if train_num_workers is not None else num_workers
+        self.train_prefetch_factor = train_prefetch_factor if train_prefetch_factor is not None else prefetch_factor
+        self.train_persistent_workers = train_persistent_workers
+        self.eval_prefetches = eval_prefetches if eval_prefetches is not None else prefetches
+        self.eval_num_workers = eval_num_workers if eval_num_workers is not None else num_workers
+        self.eval_prefetch_factor = eval_prefetch_factor if eval_prefetch_factor is not None else prefetch_factor
+        self.eval_persistent_workers = eval_persistent_workers
 
         self.db_host = db_host
         self.db_name = db_name
@@ -128,8 +204,14 @@ class CustomRunner(dl.Runner):
 
         self.masked = self._hparams["model"].get("masked", False)
 
+    @property
+    def _metric_keys(self):
+        return ["loss", "accuracy", "learning rate"]
+
     def get_engine(self):
-        if torch.cuda.device_count() > 1:
+        # Use SLURM-allocated GPU count, not total visible GPUs on the node
+        n_gpus = int(os.environ.get("SLURM_GPUS_ON_NODE", torch.cuda.device_count()))
+        if n_gpus > 1:
             return dl.DistributedDataParallelEngine(
                 # mixed_precision="fp16",
                 # ddp_kwargs={"backend": "nccl"},
@@ -146,8 +228,6 @@ class CustomRunner(dl.Runner):
                 project=self.wandb_project,
                 name=self.wandb_experiment,
                 entity=self.wandb_team,
-                log_batch_metrics=True,
-                # log_epoch_metrics=True,
             ),
         }
 
@@ -189,6 +269,15 @@ class CustomRunner(dl.Runner):
             else self.funcs["mycollate"]
         )
 
+        print(
+            "[LoaderConfig] "
+            f"train_workers={self.train_num_workers}, train_prefetch_factor={self.train_prefetch_factor}, "
+            f"train_prefetches={self.train_prefetches}, train_persistent={self.train_persistent_workers}; "
+            f"eval_workers={self.eval_num_workers}, eval_prefetch_factor={self.eval_prefetch_factor}, "
+            f"eval_prefetches={self.eval_prefetches}, eval_persistent={self.eval_persistent_workers}; "
+            f"cudnn_benchmark={torch.backends.cudnn.benchmark}"
+        )
+
         # get all IDs with the required modalities, pull their labels for cross-validation splits
 
         client = MongoClient("mongodb://" + self.db_host + ":27017")
@@ -200,20 +289,23 @@ class CustomRunner(dl.Runner):
         all_ids = posts_meta.distinct( # pull all unique IDs (subjects) with at least one modality in db_fields
             "id",
             {'modalities': {"$in": self.db_fields}}
-            #{'modalities': {"$all": self.db_fields}}
         )
         all_ids = sorted(all_ids)
         # print(all_ids)
 
-        # Batch label fetch — single query instead of one find_one per subject
+        # Fetch all split labels in one query, preserving all_ids order below.
+        label_field = self.meta_fields[0]
         meta_docs = {
-            doc["id"]: doc[self.meta_fields[0]]
+            doc["id"]: doc
             for doc in posts_meta.find(
                 {"id": {"$in": all_ids}},
-                {"id": 1, self.meta_fields[0]: 1, "_id": 0}
+                {"id": 1, label_field: 1, "_id": 0},
             )
         }
-        labels = np.array([meta_docs[i] for i in all_ids])
+        missing_label_ids = [id for id in all_ids if id not in meta_docs]
+        if missing_label_ids:
+            raise ValueError(f"Missing labels for ids: {missing_label_ids[:10]}")
+        labels = np.array([meta_docs[id][label_field] for id in all_ids])
     
         # Create CV split
         cv_folds = StratifiedKFold(n_splits=self._hparams["experiment"]["cv_folds"], shuffle=True, random_state=self._hparams["experiment"].get("cv_seed", 42))
@@ -225,7 +317,7 @@ class CustomRunner(dl.Runner):
         train_ids = all_ids[train_idx].tolist() # mongo expects default python list, not numpy array
         valid_ids = all_ids[valid_idx].tolist()
         test_ids = all_ids[test_idx].tolist()
-
+        # get data for masks calculation
         if self.masked:
             print("Preparing SNIP mask data...")
             snip_batch_size = self._hparams["model"].get("snip_batch_size", 20)
@@ -260,23 +352,32 @@ class CustomRunner(dl.Runner):
             normalize=safe_normalize,
             id=self.index_id,
         )
-        train_sampler = (
-            DBBatchSampler(train_dataset, batch_size=self.num_volumes, seed=SEED)
-            if self.engine.is_ddp
-            else DBBatchSampler(train_dataset, batch_size=self.num_volumes)
-        )
+        
+        # cv_seed comes from config — identical on 
+        cv_seed = self._hparams["experiment"].get("cv_seed", 42)
+
+        if self.engine.is_ddp:
+            rank, world_size = get_rank_world()
+            train_sampler = DistributedDBBatchSampler(
+                train_dataset, batch_size=self.num_volumes, seed=cv_seed,
+                rank=rank, world_size=world_size,
+            )
+        else:
+            train_sampler = DBBatchSampler(train_dataset, batch_size=self.num_volumes, seed=cv_seed)
+
+        train_loader_kwargs = {
+            "sampler": train_sampler,
+            "collate_fn": self.collate,
+            "pin_memory": True,
+            "worker_init_fn": self.funcs["createclient"],
+            "num_workers": self.train_num_workers,
+        }
+        if self.train_num_workers > 0:
+            train_loader_kwargs["persistent_workers"] = self.train_persistent_workers
+            train_loader_kwargs["prefetch_factor"] = self.train_prefetch_factor
         train_dataloader = BatchPrefetchLoaderWrapper(
-            DataLoader(
-                train_dataset,
-                sampler=train_sampler,
-                collate_fn=self.collate,
-                pin_memory=not self.multimodal,
-                worker_init_fn=self.funcs["createclient"],
-                persistent_workers=False,
-                prefetch_factor=2,
-                num_workers=self.num_workers,
-            ),
-            num_prefetches=self.prefetches,
+            DataLoader(train_dataset, **train_loader_kwargs),
+            num_prefetches=self.train_prefetches,
         )
 
         valid_dataset = usedDataset(
@@ -288,25 +389,21 @@ class CustomRunner(dl.Runner):
             normalize=safe_normalize,
             id=self.index_id,
         )
-        valid_sampler = (
-            DBBatchSampler(valid_dataset, batch_size=self.num_volumes, seed=SEED)
-            if self.engine.is_ddp
-            else DBBatchSampler(
-                valid_dataset, batch_size=self.num_volumes, seed=SEED
-            )
-        )
+
+        valid_sampler = DBBatchSampler(valid_dataset, batch_size=self.num_volumes, seed=cv_seed)
+        valid_loader_kwargs = {
+            "sampler": valid_sampler,
+            "collate_fn": self.collate,
+            "pin_memory": True,
+            "worker_init_fn": self.funcs["createVclient"],
+            "num_workers": self.eval_num_workers,
+        }
+        if self.eval_num_workers > 0:
+            valid_loader_kwargs["persistent_workers"] = self.eval_persistent_workers
+            valid_loader_kwargs["prefetch_factor"] = self.eval_prefetch_factor
         valid_dataloader = BatchPrefetchLoaderWrapper(
-            DataLoader(
-                valid_dataset,
-                sampler=valid_sampler,
-                collate_fn=self.collate,
-                pin_memory=not self.multimodal,
-                worker_init_fn=self.funcs["createVclient"],
-                persistent_workers=False,
-                prefetch_factor=2,
-                num_workers=self.num_workers,
-            ),
-            num_prefetches=self.prefetches,
+            DataLoader(valid_dataset, **valid_loader_kwargs),
+            num_prefetches=self.eval_prefetches,
         )
 
         test_dataset = usedDataset(
@@ -318,25 +415,20 @@ class CustomRunner(dl.Runner):
             normalize=safe_normalize,
             id=self.index_id,
         )
-        test_sampler = (
-            DBBatchSampler(test_dataset, batch_size=self.num_volumes, seed=SEED)
-            if self.engine.is_ddp
-            else DBBatchSampler(
-                test_dataset, batch_size=self.num_volumes, seed=SEED
-            )
-        )
+        test_sampler = DBBatchSampler(test_dataset, batch_size=self.num_volumes, seed=cv_seed)
+        test_loader_kwargs = {
+            "sampler": test_sampler,
+            "collate_fn": self.collate,
+            "pin_memory": True,
+            "worker_init_fn": self.funcs["createVclient"],
+            "num_workers": self.eval_num_workers,
+        }
+        if self.eval_num_workers > 0:
+            test_loader_kwargs["persistent_workers"] = self.eval_persistent_workers
+            test_loader_kwargs["prefetch_factor"] = self.eval_prefetch_factor
         test_dataloader = BatchPrefetchLoaderWrapper(
-            DataLoader(
-                test_dataset,
-                sampler=test_sampler,
-                collate_fn=self.collate,
-                pin_memory=not self.multimodal,
-                worker_init_fn=self.funcs["createVclient"],
-                persistent_workers=False,
-                prefetch_factor=2,
-                num_workers=self.num_workers,
-            ),
-            num_prefetches=self.prefetches,
+            DataLoader(test_dataset, **test_loader_kwargs),
+            num_prefetches=self.eval_prefetches,
         )
 
         return {"train": train_dataloader, "valid": valid_dataloader, "infer": test_dataloader}
@@ -344,63 +436,79 @@ class CustomRunner(dl.Runner):
     def get_snip_data(self, posts_bin, posts_meta, snip_ids):
         snip_dict = {}
 
+        # 1. Fetch all binary data for SNIP in one batch
         snip_samples = list(
             posts_bin.find(
                 {
                     "id": {"$in": snip_ids},
-                    "kind": {"$in": self.db_fields}, # .bin contains 3D kinds like 'smri', 'falff', 'dwi'. Scalar labels are stored in .meta
+                    "kind": {"$in": self.db_fields}, 
                 },
                 {"id": 1, "chunk": 1, "kind": 1, "chunk_id": 1},
             )
         )
 
+        # Pre-group chunks by (id, kind) for O(N) access
+        chunks_by_id_kind = {}
+        for s in snip_samples:
+            key = (s["id"], s["kind"])
+            if key not in chunks_by_id_kind:
+                chunks_by_id_kind[key] = []
+            chunks_by_id_kind[key].append(s)
+
+        # 2. Fetch all metadata for SNIP in one batch
+        all_meta = list(
+            posts_meta.find(
+                {"id": {"$in": snip_ids}},
+                list(self.meta_fields) + ["modalities", "id"],
+            )
+        )
+        meta_lookup = {meta["id"]: meta for meta in all_meta}
+
         for id in snip_ids:
             # get ID's label and modalities
-            meta_for_id = list(
-                posts_meta.find(
-                    {
-                        "id": id,
-                    },
-                    list(self.meta_fields) + ["modalities"],
-                )
-            )
+            meta_for_id = meta_lookup.get(id)
+            if meta_for_id is None:
+                print(f"[WARN] No metadata for SNIP subject {id}, skipping.")
+                continue
 
-            assert len(meta_for_id) != 0, f"No meta entries found for id {id}"
-            assert len(meta_for_id) < 2, f"More than one meta entry found for id {id}"
-
-            label = meta_for_id[0][self.meta_fields[0]]
-            modalities = meta_for_id[0]["modalities"]
+            label = meta_for_id[self.meta_fields[0]]
+            modalities = meta_for_id["modalities"]
             id_modalities = set(modalities).intersection(set(self.db_fields))
 
-            # Get samples for this ID
-            samples_for_id = [
-                sample
-                for sample in snip_samples
-                if sample["id"] == id
-            ]
-
             for mod in id_modalities:
-                data = make_serial(samples_for_id, mod)
+                # Optimized: get pre-grouped chunks and sort them
+                samples_for_id_kind = chunks_by_id_kind.get((id, mod), [])
+                if not samples_for_id_kind:
+                    continue
+                
+                samples_for_id_kind.sort(key=lambda x: x["chunk_id"])
+                data = b"".join([s["chunk"] for s in samples_for_id_kind])
 
-                for mod in id_modalities:
-                    data = make_serial(samples_for_id, mod)
+                result = {
+                    "input": safe_normalize(self.funcs["mytransform"](data).float()),
+                    "modality": mod,
+                    "label": torch.tensor(label).unsqueeze(0),
+                }
 
-                    result = {
-                        "input": safe_normalize(self.funcs["mytransform"](data).float()),
-                        "modality": mod,
-                        "label": torch.tensor(label).unsqueeze(0),
-                    }
-
-                    snip_dict[str(id)+'_'+mod] = result
+                snip_dict[str(id)+'_'+mod] = result
 
         return multimodal_collate({0:snip_dict}) # dict is expected in collate
 
     def get_model(self):
+        model_init_seed = self._hparams["model"].get("model_init_seed", None)
+        if model_init_seed is not None:
+            rng_state = torch.get_rng_state()
+            torch.manual_seed(model_init_seed)
+
         model = ResNet3D(
-            in_channels=1, 
-            n_classes=self.n_classes, 
+            in_channels=1,
+            n_classes=self.n_classes,
             channels=self.n_channels
         )
+
+        if model_init_seed is not None:
+            torch.set_rng_state(rng_state)
+            print(f"Model initialized with fixed seed {model_init_seed}")
 
         init_weights_path = self._hparams["model"].get("init_weights_path", None)
         if init_weights_path and os.path.exists(init_weights_path):
@@ -416,15 +524,13 @@ class CustomRunner(dl.Runner):
                 sparsity=self._hparams["model"].get("sparsity", 0.9),
             )
 
-            # Check if we should use smart initialization from unimodal models
             use_smart_init = self._hparams["model"].get("smart_init", False)
             unimodal_paths = self._hparams["model"].get("unimodal_model_paths", None)
-            
+
             if use_smart_init and unimodal_paths:
                 print("Using smart initialization from unimodal models...")
                 print(f"Unimodal paths config: {unimodal_paths}")
-                
-                # Load unimodal model state_dicts
+
                 unimodal_checkpoints = {}
                 for mod_id, path in unimodal_paths.items():
                     print(f"Processing modality: {mod_id}, path: {path}")
@@ -434,18 +540,14 @@ class CustomRunner(dl.Runner):
                         unimodal_checkpoints[mod_id] = checkpoint
                     else:
                         raise FileNotFoundError(f"Unimodal model path not found: {path}")
-                
-                # Initialize from unimodal models: load pretrained masks, apply SNIP
-                # on fixed-init weights, intersect masks, then average weights
+
                 snip_data, snip_modalities, snip_labels = self.snip_data
                 model.initialize_from_unimodal_models(
                     unimodal_checkpoints,
                     snip_data=(snip_data, snip_modalities, snip_labels)
                 )
                 print("Smart initialization complete!")
-                
             else:
-                # Standard SNIP initialization from scratch
                 print("Initializing masks from scratch using SNIP...")
                 snip_data, snip_modalities, snip_labels = self.snip_data
                 model.register_multimodal_masks(snip_modalities, snip_data, snip_labels)
@@ -500,50 +602,32 @@ class CustomRunner(dl.Runner):
         super().on_loader_start(runner)
         self.meters = {
             key: metrics.AdditiveValueMetric(compute_on_call=False)
-            for key in ["loss", "accuracy", "learning rate"]
+            for key in self._metric_keys
         }
-        self.meters["auc"] = metrics.AUCMetric(
-            compute_on_call=False
-        )
+        self.meters["auc"] = metrics.AUCMetric(compute_on_call=False)
 
-        # --- CSV LOGGING SETUP ---
         rank = distributed.get_rank()
-        loader_key = self.loader_key # e.g., "train", "valid"
-        self.csv_filename = os.path.join(
-            self._logdir, 
-            f"raw_preds_{loader_key}_rank_{rank}.csv"
-        )
+        loader_key = self.loader_key
+        self.csv_filename = os.path.join(self._logdir, f"raw_preds_{loader_key}_rank_{rank}.csv")
         file_exists = os.path.isfile(self.csv_filename) and os.path.getsize(self.csv_filename) > 0
-
-        self.csv_file = open(self.csv_filename, 'a', newline='')
+        self.csv_file = open(self.csv_filename, "a", newline="")
         self.csv_writer = csv.writer(self.csv_file)
-        
-        # Write header only if file is new
         if not file_exists:
             self.csv_writer.writerow(["epoch", "probability", "target"])
 
-
     def on_loader_end(self, runner):
-        for key in ["loss", "accuracy", "learning rate"]:
+        for key in self._metric_keys:
             self.loader_metrics[key] = self.meters[key].compute()[0]
         self.loader_metrics["auc"] = self.meters["auc"].compute()[2]
 
         if self.engine.is_ddp:
-            # Get world_size explicitly
             world_size = distributed.get_world_size()
-            
-            for key in ["loss", "accuracy"]:
+            for key in ["loss", "accuracy", "auc"]:
                 local_val = self.loader_metrics[key]
-                
-                # Create a tensor on the correct device
-                # self.engine.device is reliable for the current worker's device
                 val_tensor = torch.tensor([local_val], device=self.engine.device)
-                
-                # FIX: Pass world_size to mean_reduce
                 avg_tensor = distributed.mean_reduce(val_tensor, world_size)
                 self.loader_metrics[key] = avg_tensor.item()
 
-        # CSV Safety Close
         if hasattr(self, 'csv_file') and self.csv_file:
             self.csv_file.close()
 
@@ -551,18 +635,12 @@ class CustomRunner(dl.Runner):
 
     # model train/valid step
     def handle_batch(self, batch):
-
-        #print(f'[DEBUG] batch_step={self.batch_step}', flush=True)
-        # # Add synchronization before processing
-        # if self.engine.is_ddp:
-        #     torch.cuda.synchronize()
-        
-        if self.multimodal: #MM
+        if self.multimodal:
             sample, modality, label = batch
         else:
             sample, label = batch
+            modality = None
 
-        # run model forward/backward pass
         if self.model.training:
             if self.bit16:
                 with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
@@ -574,9 +652,6 @@ class CustomRunner(dl.Runner):
                 scaler.update()
                 self.optimizer.zero_grad()
             else:
-                if torch.isnan(sample).any() or torch.isinf(sample).any():
-                    print(f'[WARN] Bad input at step {self.batch_step}: nan={torch.isnan(sample).sum()} inf={torch.isinf(sample).sum()}')
-                    print(f"[WARN] Input shape: {sample.shape}, dtype: {sample.dtype}, min: {sample.min()}, max: {sample.max()}")
                 y_hat = self.model.forward(sample) if not self.masked else self.model.forward(sample, modality)
                 loss = self.criterion(y_hat, label.float())
                 loss.backward()
@@ -588,42 +663,24 @@ class CustomRunner(dl.Runner):
                 y_hat = self.model.forward(sample) if not self.masked else self.model.forward(sample, modality)
                 loss = self.criterion(y_hat, label.float())
 
-        # Metrics calculation and CSV logging
         with torch.no_grad():
             proba_preds = torch.sigmoid(y_hat)
             preds = proba_preds > 0.5
             accuracy = (preds == label).float().mean()
-            
-            # CSV logging: Move to CPU / Numpy
             probs_np = proba_preds.detach().cpu().numpy().flatten()
             targets_np = label.detach().cpu().numpy().flatten()
-            epochs_np = [self.epoch_step] * len(probs_np)
-            rows = zip(epochs_np, probs_np, targets_np)
-            self.csv_writer.writerows(rows)
-
+            self.csv_writer.writerows(zip([self.epoch_step] * len(probs_np), probs_np, targets_np))
 
         self.batch_metrics.update({
             "loss": loss,
-            "accuracy": accuracy, 
-            "learning rate": torch.tensor(
-                    self.optimizer.param_groups[0]["lr"]
-            )
+            "accuracy": accuracy,
+            "learning rate": torch.tensor(self.optimizer.param_groups[0]["lr"]),
         })
         for key in self.batch_metrics:
-            self.meters[key].update(
-                self.batch_metrics[key].item(), self.batch_size
-            )
+            self.meters[key].update(self.batch_metrics[key].item(), self.batch_size)
         self.meters["auc"].update(proba_preds, label)
 
-        del sample
-        del label
-        del y_hat
-        del loss
-        del proba_preds
-        del preds
-        del accuracy
-        if self.multimodal:
-            del modality
+        del sample, label, y_hat, loss
 
 @hydra.main(config_path="conf", config_name="new_conf", version_base=None)
 def main(cfg: DictConfig):
@@ -659,9 +716,43 @@ def main(cfg: DictConfig):
     epochs = cfg.experiment.epochs
     prefetches = cfg.experiment.prefetches
     num_workers = cfg.experiment.num_workers
+    prefetch_factor = cfg.experiment.prefetch_factor
+    train_prefetches = cfg.experiment.get("train_prefetches", None)
+    train_num_workers = cfg.experiment.get("train_num_workers", None)
+    train_prefetch_factor = cfg.experiment.get("train_prefetch_factor", None)
+    train_persistent_workers = cfg.experiment.get("train_persistent_workers", True)
+    eval_prefetches = cfg.experiment.get("eval_prefetches", None)
+    eval_num_workers = cfg.experiment.get("eval_num_workers", None)
+    eval_prefetch_factor = cfg.experiment.get("eval_prefetch_factor", None)
+    eval_persistent_workers = cfg.experiment.get("eval_persistent_workers", True)
+    cudnn_benchmark = cfg.experiment.get("cudnn_benchmark", False)
+    max_folds = cfg.experiment.get("max_folds", None)
     attenuates = cfg.experiment.attenuates
+    torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
 
+    # we need oneCycleLR, but not the rest of the curiculum
+    subvolume_shape = [cubesizes] * 3
+    # Use SLURM_GPUS_ON_NODE — same source as get_engine() — since DDP is not
+    # initialized yet when main() runs (Catalyst forks processes inside runner.run()).
+    world_size = int(os.environ.get("SLURM_GPUS_ON_NODE", torch.cuda.device_count()))
+    onecycle_lr = rmsprop_lr = (
+        attenuates # this comes from 0.8/0.2 training? what is this input for oneCycleLR? TODO: trace it further
+        * 1
+        * cfg.experiment.lr_scale
+        * numcubes
+        * numvolumes
+        * world_size
+        / 256
+    )
+    wandb_experiment = (
+        f"{experiment_name}: {collections}, {dbfields}-{metafields}, masked={cfg.model.get('masked', False)}, sps={cfg.model.get('sparsity', None)}"
+    )
 
+    # Set database parameters
+    client_creator.set_database(databases)
+    client_creator.set_collection(collections)
+    client_creator.set_num_subcubes(numcubes)
+    client_creator.set_shape(subvolume_shape)
 
     # paths:
     #     loadcheckpoint: False
@@ -673,32 +764,18 @@ def main(cfg: DictConfig):
     # Set hparams
     hparams = OmegaConf.to_container(cfg, resolve=True)
 
+    folds_to_run = cfg.experiment.cv_folds if max_folds is None else min(cfg.experiment.cv_folds, int(max_folds))
+    if folds_to_run < 1:
+        raise ValueError("experiment.max_folds must be at least 1 when set")
+
     # run cross-validation
-    for fold_idx in range(cfg.experiment.cv_folds):
-        subvolume_shape = [cubesizes] * 3
-        onecycle_lr = rmsprop_lr = (
-            attenuates 
-            * 1
-            * cfg.experiment.lr_scale
-            * numcubes
-            * numvolumes
-            / 256
-        )
-        wandb_experiment = (
-            f"{experiment_name}: {collections}, {dbfields}-{metafields}, masked={cfg.model.get('masked', False)}, sps={cfg.model.get('sparsity', None)}"
-        )
+    for fold_idx in range(folds_to_run):
 
         print(f"Starting fold {fold_idx+1}/{cfg.experiment.cv_folds}")
         hparams["fold_idx"] = fold_idx
 
-        # Set database parameters
-        client_creator.set_database(databases)
-        client_creator.set_collection(collections)
-        client_creator.set_num_subcubes(numcubes)
-        client_creator.set_shape(subvolume_shape)
-
         rundir = f"{logdir}/fold_{fold_idx}"
-        os.makedirs(logdir, exist_ok=True)
+        os.makedirs(rundir, exist_ok=True)
 
         runner = CustomRunner(
             logdir=rundir, # this is self._logdir
@@ -720,6 +797,15 @@ def main(cfg: DictConfig):
             off_brain_weight=weights,
             prefetches=prefetches,
             num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            train_prefetches=train_prefetches,
+            train_num_workers=train_num_workers,
+            train_prefetch_factor=train_prefetch_factor,
+            train_persistent_workers=train_persistent_workers,
+            eval_prefetches=eval_prefetches,
+            eval_num_workers=eval_num_workers,
+            eval_prefetch_factor=eval_prefetch_factor,
+            eval_persistent_workers=eval_persistent_workers,
             indexid=cfg.mongo.index_id,
             db_collection=collections,
             db_name=databases,
