@@ -283,7 +283,7 @@ class CustomRunner(dl.Runner):
             # SEED): runs in every DDP worker, so all ranks must select the SAME snip
             # batch and build the SAME mask instead of relying on DDP's rank-0 broadcast.
             rng = random.Random(self.sampler_seed)
-            snip_batch_ids = rng.sample(train_ids, len(train_ids))[:snip_batch_size]
+            snip_batch_ids = rng.sample(train_ids, k=min(snip_batch_size, len(train_ids)))
 
             snip_data, snip_modalities, snip_labels = self.get_snip_data(posts_bin, posts_meta, snip_batch_ids)
             self.snip_data = (snip_data, snip_modalities, snip_labels)
