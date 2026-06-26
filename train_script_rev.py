@@ -8,7 +8,6 @@ import os
 import csv
 import random
 import shutil
-import math
 from packaging import version
 import yaml
 
@@ -53,62 +52,6 @@ else:
     scaler = torch.cuda.amp.GradScaler()
 
 
-def get_rank_world():
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(), torch.distributed.get_world_size()
-    return int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
-
-
-class DistributedDBBatchSampler(DBBatchSampler):
-    """
-    Rank-sharded variant of DBBatchSampler.
-
-    DataLoader passes each yielded item to MongoDataset.__getitem__ as a batch
-    of subject indices, so sharding must happen before those mini-batches are
-    formed. Padding keeps each DDP rank at the same number of steps.
-    """
-
-    def __init__(
-        self,
-        data_source,
-        batch_size=1,
-        seed=None,
-        rank=None,
-        world_size=None,
-    ):
-        super().__init__(data_source, batch_size=batch_size, seed=seed)
-        detected_rank, detected_world_size = get_rank_world()
-        self.rank = detected_rank if rank is None else rank
-        self.world_size = detected_world_size if world_size is None else world_size
-        self.global_batch_size = self.batch_size * self.world_size
-        self.num_batches = int(math.ceil(self.data_size / self.global_batch_size))
-        self.total_size = self.num_batches * self.global_batch_size
-
-    def __iter__(self):
-        if self.seed is not None:
-            rng = np.random.default_rng(self.seed)
-            indices = rng.permutation(self.data_size)
-        else:
-            indices = np.random.permutation(self.data_size)
-
-        padding_size = self.total_size - len(indices)
-        if padding_size > 0 and len(indices) > 0:
-            repeats = int(math.ceil(padding_size / len(indices)))
-            padding = np.tile(indices, repeats)[:padding_size]
-            indices = np.concatenate([indices, padding])
-
-        rank_batches = []
-        for start in range(0, self.total_size, self.global_batch_size):
-            global_batch = indices[start : start + self.global_batch_size]
-            rank_start = self.rank * self.batch_size
-            rank_end = rank_start + self.batch_size
-            rank_batches.append(global_batch[rank_start:rank_end])
-
-        return iter(rank_batches)
-
-    def __len__(self):
-        return self.num_batches
-    
 # CustomRunner – PyTorch for-loop decomposition
 # https://github.com/catalyst-team/catalyst#minimal-examples
 class CustomRunner(dl.Runner):
@@ -155,6 +98,7 @@ class CustomRunner(dl.Runner):
         lossweight=[1, 0],
         maxshape=300,
         hparams=None,
+        sampler_seed=None,
     ):
         super().__init__()
         self._logdir = logdir
@@ -202,6 +146,13 @@ class CustomRunner(dl.Runner):
         self.maxshape = maxshape
         self._hparams = hparams
 
+        # Seed for the data samplers. Must be IDENTICAL across DDP ranks: the
+        # module-level SEED is re-drawn per worker under Catalyst's mp.spawn, so
+        # using it directly makes each rank shuffle differently and breaks the
+        # shard partition. This value is drawn once in main() (the parent
+        # __main__ process) and passed in, so it ships to every rank via pickling.
+        self.sampler_seed = sampler_seed if sampler_seed is not None else SEED
+
         self.masked = self._hparams["model"].get("masked", False)
 
     @property
@@ -209,13 +160,20 @@ class CustomRunner(dl.Runner):
         return ["loss", "accuracy", "learning rate"]
 
     def get_engine(self):
-        # Use SLURM-allocated GPU count, not total visible GPUs on the node
+        # Use SLURM-allocated GPU count, not total visible GPUs on the node.
+        # torch.cuda.device_count() is unreliable on this cluster: CUDA_VISIBLE_DEVICES
+        # is unset, so it reports ALL physical GPUs on the node (e.g. 5) regardless of
+        # the allocation. SLURM_GPUS_ON_NODE tracks the real allocation. Catalyst's
+        # engine otherwise spawns one process per *physical* GPU (via device_count),
+        # so we pin the spawn/world size with num_node_workers/world_size.
         n_gpus = int(os.environ.get("SLURM_GPUS_ON_NODE", torch.cuda.device_count()))
         if n_gpus > 1:
             return dl.DistributedDataParallelEngine(
                 # mixed_precision="fp16",
                 # ddp_kwargs={"backend": "nccl"},
                 process_group_kwargs={"backend": "nccl"},
+                num_node_workers=n_gpus,
+                world_size=n_gpus,
             )
         else:
             return dl.GPUEngine()
@@ -321,8 +279,11 @@ class CustomRunner(dl.Runner):
         if self.masked:
             print("Preparing SNIP mask data...")
             snip_batch_size = self._hparams["model"].get("snip_batch_size", 20)
-            rng = random.Random(SEED) 
-            snip_batch_ids = rng.sample(train_ids, len(train_ids))[:snip_batch_size]
+            # Use the cross-rank-consistent sampler seed (NOT the per-process module
+            # SEED): runs in every DDP worker, so all ranks must select the SAME snip
+            # batch and build the SAME mask instead of relying on DDP's rank-0 broadcast.
+            rng = random.Random(self.sampler_seed)
+            snip_batch_ids = rng.sample(train_ids, k=min(snip_batch_size, len(train_ids)))
 
             snip_data, snip_modalities, snip_labels = self.get_snip_data(posts_bin, posts_meta, snip_batch_ids)
             self.snip_data = (snip_data, snip_modalities, snip_labels)
@@ -353,17 +314,16 @@ class CustomRunner(dl.Runner):
             id=self.index_id,
         )
         
-        # cv_seed comes from config — identical on 
-        cv_seed = self._hparams["experiment"].get("cv_seed", 42)
-
-        if self.engine.is_ddp:
-            rank, world_size = get_rank_world()
-            train_sampler = DistributedDBBatchSampler(
-                train_dataset, batch_size=self.num_volumes, seed=cv_seed,
-                rank=rank, world_size=world_size,
-            )
-        else:
-            train_sampler = DBBatchSampler(train_dataset, batch_size=self.num_volumes, seed=cv_seed)
+        # Train uses a plain DBBatchSampler with a cross-rank-consistent seed
+        # (self.sampler_seed, identical on every rank). Catalyst/accelerate's
+        # engine.prepare() ALREADY shards the DataLoader across ranks, so a plain
+        # sampler with the same seed yields a clean disjoint partition with full
+        # coverage (verified by the DDP probe: 100% coverage, disjoint, balanced).
+        # DistributedDBBatchSampler is intentionally NOT used here: it pre-shards,
+        # and accelerate then shards again -> double-sharding that drops
+        # ~(1 - 1/world_size) of the data each epoch.
+        # cv_seed (config) is used only for the CV splits above.
+        train_sampler = DBBatchSampler(train_dataset, batch_size=self.num_volumes, seed=self.sampler_seed)
 
         train_loader_kwargs = {
             "sampler": train_sampler,
@@ -390,7 +350,7 @@ class CustomRunner(dl.Runner):
             id=self.index_id,
         )
 
-        valid_sampler = DBBatchSampler(valid_dataset, batch_size=self.num_volumes, seed=cv_seed)
+        valid_sampler = DBBatchSampler(valid_dataset, batch_size=self.num_volumes, seed=self.sampler_seed)
         valid_loader_kwargs = {
             "sampler": valid_sampler,
             "collate_fn": self.collate,
@@ -415,7 +375,7 @@ class CustomRunner(dl.Runner):
             normalize=safe_normalize,
             id=self.index_id,
         )
-        test_sampler = DBBatchSampler(test_dataset, batch_size=self.num_volumes, seed=cv_seed)
+        test_sampler = DBBatchSampler(test_dataset, batch_size=self.num_volumes, seed=self.sampler_seed)
         test_loader_kwargs = {
             "sampler": test_sampler,
             "collate_fn": self.collate,
@@ -768,6 +728,12 @@ def main(cfg: DictConfig):
     if folds_to_run < 1:
         raise ValueError("experiment.max_folds must be at least 1 when set")
 
+    # Sampler seed: drawn ONCE here in the (parent) __main__ process and passed
+    # into the runner so every DDP rank receives the same value via pickling.
+    # The module-level SEED is re-drawn per worker by mp.spawn and is NOT safe
+    # for the distributed sampler (it would differ per rank).
+    sampler_seed = random.randint(0, 9999)
+
     # run cross-validation
     for fold_idx in range(folds_to_run):
 
@@ -818,6 +784,7 @@ def main(cfg: DictConfig):
             wandb_team=cfg.wandb.team,
             maxshape=cfg.model.maxshape,
             hparams=hparams,
+            sampler_seed=sampler_seed,
         )
         runner.run()
         del runner
